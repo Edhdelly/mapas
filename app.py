@@ -1,210 +1,445 @@
 import os
-import re
 import zipfile
 import tempfile
 from pathlib import Path
 
 import streamlit as st
 import geopandas as gpd
-import pandas as pd
 import folium
 from folium.plugins import Fullscreen, LocateControl
 from streamlit_folium import st_folium
 
-# Configuração da página otimizada para mobile (layout wide aproveita 100% da largura da tela)
 st.set_page_config(
-    page_title="Visualizador GIS Mobile",
-    page_icon="🛰️",
+    page_title="Mapa Colhedora e Transbordo",
+    page_icon="🚜",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# Ajuste de CSS para melhorar visualização em telas de celular
+# CSS otimizado para uso em celular
 st.markdown("""
     <style>
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+        
         .block-container {
-            padding-top: 1rem;
-            padding-bottom: 1rem;
-            padding-left: 0.5rem;
-            padding-right: 0.5rem;
+            padding-top: 0.8rem;
+            padding-bottom: 1.5rem;
+            padding-left: 0.8rem;
+            padding-right: 0.8rem;
         }
+        
+        /* Checkboxes grandes e espaçados para facilitar o toque */
+        div[data-testid="stCheckbox"] label {
+            font-size: 1.05rem !important;
+            font-weight: 600 !important;
+            padding: 8px 4px !important;
+            line-height: 1.4 !important;
+        }
+        
+        /* Botões de ação maiores */
+        div.stButton > button {
+            width: 100%;
+            min-height: 48px;
+            font-size: 1.05rem !important;
+            font-weight: bold !important;
+            border-radius: 8px;
+        }
+        
+        /* Botão do Google Maps */
+        .btn-maps {
+            display: block;
+            width: 100%;
+            background-color: #2E7D32;
+            color: white !important;
+            text-align: center;
+            padding: 14px 10px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            border-radius: 10px;
+            text-decoration: none !important;
+            margin-top: 6px;
+            margin-bottom: 10px;
+            box-shadow: 0 3px 6px rgba(0,0,0,0.25);
+        }
+        
+        /* Legenda de cores */
+        .legenda-item {
+            display: inline-block;
+            padding: 6px 10px;
+            margin: 3px;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 0.9rem;
+            color: #000;
+            border: 2px solid #222;
+        }
+        
         iframe {
             width: 100% !important;
-            border-radius: 8px;
+            border-radius: 12px;
+            border: 2px solid #444;
         }
     </style>
 """, unsafe_allow_html=True)
 
-st.subheader("🛰️ Visualizador de Mapas e Talhões (Shapefile / AgGPS)")
+st.markdown("### 🚜 Visualizador de Mapas e Telemetria")
 
-uploaded_file = st.file_uploader(
-    "Selecione o arquivo .ZIP contendo as pastas e arquivos (.shp, .dbf, .shx, .pos)",
-    type=["zip"]
+# Cores vibrantes para diferenciar cada bloco selecionado sobre o satélite
+CORES_BLOCOS = [
+    "#FFEA00",  # Amarelo
+    "#00E5FF",  # Azul Ciano
+    "#FF3D00",  # Laranja/Vermelho
+    "#76FF03",  # Verde Limão
+    "#FF4081",  # Rosa Claro
+    "#E040FB",  # Lilás
+    "#FFFFFF",  # Branco
+    "#FFD740",  # Ouro
+]
+
+# Oculta APENAS subpastas internas genéricas de sistema, mantendo todos os equipamentos
+PASTAS_SISTEMA_IGNORADAS = {"aggps", "data", "__macosx"}
+
+# Termos conhecidos para destacar automaticamente o equipamento de telemetria
+TERMOS_EQUIPAMENTOS = [
+    "CASE", "PRO700", "PRO_700", "TRIMBLE", "TRIMVLE", "GFX", 
+    "2GUIDANCE", "GS3", "GEN4", "SOLINFTEC", "HEXAGON", "STARA", "JD"
+]
+
+def extrair_metadados_caminho(shp_path: Path, base_path: Path) -> dict:
+    """
+    Identifica Operação (COLHEDORA/TRANSBORDO), Equipamento (Case_PRO700, TRIMBLE_GFX, etc.)
+    e mantém todas as pastas úteis visíveis no nome.
+    """
+    partes_brutas = list(shp_path.relative_to(base_path).parts)
+    partes_pastas = [p for p in partes_brutas[:-1] if p.lower() not in PASTAS_SISTEMA_IGNORADAS]
+    nome_arquivo = shp_path.stem
+
+    # 1. Identifica Operação (Colhedora ou Transbordo)
+    operacao = "OUTROS"
+    icone_op = "📍"
+    idx_operacao = -1
+
+    for i, pasta in enumerate(partes_pastas):
+        p_upper = pasta.upper()
+        if "COLHEDORA" in p_upper:
+            operacao = "COLHEDORA"
+            icone_op = "🚜"
+            idx_operacao = i
+            break
+        elif "TRANSBORDO" in p_upper:
+            operacao = "TRANSBORDO"
+            icone_op = "🚛"
+            idx_operacao = i
+            break
+
+    # 2. Identifica o Equipamento de Telemetria (ex: Case_PRO700, TRIMBLE_GFX, 2Guidance)
+    equipamento = "Não especificado"
+    
+    # Primeiro procura pela pasta logo após COLHEDORA/TRANSBORDO
+    if idx_operacao != -1 and (idx_operacao + 1) < len(partes_pastas):
+        candidato = partes_pastas[idx_operacao + 1]
+        if not candidato.upper().startswith(("RAIZEN", "BLOCO")):
+            equipamento = candidato
+
+    # Se não achou pela posição, procura por palavras-chave de equipamentos em qualquer pasta
+    if equipamento == "Não especificado":
+        for pasta in partes_pastas:
+            p_upper = pasta.upper()
+            if any(termo in p_upper for termo in TERMOS_EQUIPAMENTOS):
+                equipamento = pasta
+                break
+
+    # 3. Monta o texto completo destacando Operação, Equipamento e Bloco
+    partes_formatadas = []
+    for pasta in partes_pastas:
+        if pasta == equipamento:
+            partes_formatadas.append(f"📡 {pasta}")
+        else:
+            partes_formatadas.append(pasta)
+
+    caminho_limpo = " / ".join(partes_formatadas) if partes_formatadas else nome_arquivo
+    if nome_arquivo.lower() not in ["linefeature", "boundary", "coverage"]:
+        caminho_limpo = f"{caminho_limpo} ({nome_arquivo})"
+
+    label_exibicao = f"{icone_op} {caminho_limpo}"
+
+    return {
+        "label": label_exibicao,
+        "operacao": operacao,
+        "equipamento": equipamento,
+        "path": shp_path
+    }
+
+def listar_shapefiles(diretorio: Path) -> list:
+    shp_files = sorted(list(diretorio.rglob("*.shp")))
+    itens = []
+    labels_vistos = set()
+
+    for idx, shp in enumerate(shp_files):
+        meta = extrair_metadados_caminho(shp, diretorio)
+        label_original = meta["label"]
+        contador = 2
+        while meta["label"] in labels_vistos:
+            meta["label"] = f"{label_original} ({contador})"
+            contador += 1
+        labels_vistos.add(meta["label"])
+        # Chave única para o session_state do Streamlit
+        meta["key"] = f"chk_item_{idx}_{meta['label']}"
+        itens.append(meta)
+    return itens
+
+# 1. Carregamento dos Arquivos
+pasta_atual = Path(".")
+zips_locais = list(pasta_atual.glob("*.zip"))
+shps_locais = list(pasta_atual.rglob("*.shp"))
+
+arquivo_upload = None
+if shps_locais or zips_locais:
+    with st.expander("📁 Enviar outro arquivo .ZIP do celular"):
+        arquivo_upload = st.file_uploader("Escolha o arquivo .ZIP", type=["zip"])
+else:
+    st.info("👇 **Passo 1:** Toque abaixo para escolher o arquivo **.ZIP** com os mapas.")
+    arquivo_upload = st.file_uploader("Escolher arquivo .ZIP", type=["zip"])
+
+tmpdir_obj = tempfile.TemporaryDirectory()
+tmpdir = Path(tmpdir_obj.name)
+lista_mapas = []
+
+if arquivo_upload is not None:
+    zip_path = tmpdir / "upload.zip"
+    with open(zip_path, "wb") as f:
+        f.write(arquivo_upload.getbuffer())
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(tmpdir)
+        lista_mapas = listar_shapefiles(tmpdir)
+    except zipfile.BadZipFile:
+        st.error("❌ Arquivo .ZIP inválido.")
+        st.stop()
+elif shps_locais:
+    lista_mapas = listar_shapefiles(pasta_atual)
+elif zips_locais:
+    try:
+        with zipfile.ZipFile(zips_locais[0], "r") as z:
+            z.extractall(tmpdir)
+        lista_mapas = listar_shapefiles(tmpdir)
+    except Exception:
+        pass
+
+if not lista_mapas:
+    st.stop()
+
+# Inicializa o estado de cada checkbox na memória (marca o 1º por padrão na primeira abertura)
+for idx, item in enumerate(lista_mapas):
+    chave = item["key"]
+    if chave not in st.session_state:
+        st.session_state[chave] = (idx == 0)
+
+# 2. Filtros Rápidos (Operação e Equipamento de Telemetria)
+col_f1, col_f2 = st.columns(2)
+
+with col_f1:
+    operacoes_presentes = sorted(list({item["operacao"] for item in lista_mapas}))
+    opcoes_op = ["📋 TODAS AS MÁQUINAS"]
+    if "COLHEDORA" in operacoes_presentes:
+        opcoes_op.append("🚜 SÓ COLHEDORA")
+    if "TRANSBORDO" in operacoes_presentes:
+        opcoes_op.append("🚛 SÓ TRANSBORDO")
+    if "OUTROS" in operacoes_presentes and len(operacoes_presentes) > 1:
+        opcoes_op.append("📍 OUTROS")
+
+    filtro_op = st.radio("1️⃣ Filtrar por Máquina:", options=opcoes_op, horizontal=True)
+
+with col_f2:
+    equipamentos_presentes = sorted(list({item["equipamento"] for item in lista_mapas if item["equipamento"] != "Não especificado"}))
+    if equipamentos_presentes:
+        opcoes_eq = ["📡 TODOS OS EQUIPAMENTOS"] + [f"📡 {eq}" for eq in equipamentos_presentes]
+        filtro_eq = st.radio("2️⃣ Filtrar por Equipamento / Monitor:", options=opcoes_eq, horizontal=True)
+    else:
+        filtro_eq = "📡 TODOS OS EQUIPAMENTOS"
+
+# Aplica os filtros selecionados
+mapas_filtrados = []
+for item in lista_mapas:
+    if filtro_op == "🚜 SÓ COLHEDORA" and item["operacao"] != "COLHEDORA":
+        continue
+    if filtro_op == "🚛 SÓ TRANSBORDO" and item["operacao"] != "TRANSBORDO":
+        continue
+    if filtro_op == "📍 OUTROS" and item["operacao"] != "OUTROS":
+        continue
+    if filtro_eq != "📡 TODOS OS EQUIPAMENTOS":
+        nome_eq_limpo = filtro_eq.replace("📡 ", "")
+        if item["equipamento"] != nome_eq_limpo:
+            continue
+    mapas_filtrados.append(item)
+
+# 3. Funções de Callback para os botões funcionarem instantaneamente
+chaves_filtradas = [item["key"] for item in mapas_filtrados]
+todas_as_chaves = [item["key"] for item in lista_mapas]
+
+def marcar_visiveis(chaves):
+    for k in chaves:
+        st.session_state[k] = True
+
+def limpar_tudo(chaves):
+    for k in chaves:
+        st.session_state[k] = False
+
+st.markdown("**3️⃣ Toque nos blocos abaixo para marcar ou desmarcar no mapa:**")
+
+col_btn1, col_btn2 = st.columns(2)
+with col_btn1:
+    st.button(
+        "✅ Marcar Todos da Lista",
+        on_click=marcar_visiveis,
+        args=(chaves_filtradas,),
+        use_container_width=True
+    )
+with col_btn2:
+    st.button(
+        "🧹 Limpar Seleção",
+        on_click=limpar_tudo,
+        args=(todas_as_chaves,),
+        use_container_width=True
+    )
+
+# Renderiza os checkboxes (vinculados diretamente ao session_state pela key)
+with st.container(border=True):
+    if not mapas_filtrados:
+        st.info("Nenhum bloco encontrado para este filtro.")
+    for item in mapas_filtrados:
+        st.checkbox(item["label"], key=item["key"])
+
+# Coleta todos os blocos que estão marcados
+itens_selecionados = [item for item in lista_mapas if st.session_state.get(item["key"], False)]
+
+tipo_mapa = st.radio(
+    "4️⃣ Tipo de imagem do mapa:",
+    options=["🛰️ Satélite (Foto Real)", "🛣️ Mapa de Estradas"],
+    horizontal=True
 )
 
-def parse_pos_filename(filename: str):
-    """Extrai coordenadas do padrão de nome AgGPS: -47.4446E-22.8526N.pos"""
-    match = re.search(r"(-?\d+\.\d+)[EW](-?\d+\.\d+)[NS]", filename, re.IGNORECASE)
-    if match:
-        lon = float(match.group(1))
-        lat = float(match.group(2))
-        return lat, lon
-    return None
+if not itens_selecionados:
+    st.warning("👆 Nenhum bloco está marcado. Toque em pelo menos uma caixa acima (ou em 'Marcar Todos') para ver o mapa.")
+    st.stop()
 
-if uploaded_file is not None:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, "dados.zip")
-        with open(zip_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+# 4. Construção do Mapa
+m = folium.Map(
+    location=[-22.8526, -47.4446],
+    zoom_start=16,
+    tiles=None,
+    control_scale=True
+)
 
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                zip_ref.extractall(tmpdir)
-        except zipfile.BadZipFile:
-            st.error("O arquivo enviado não é um .ZIP válido. Se estiver em .RAR, recrie como .ZIP.")
-            st.stop()
+if "Satélite" in tipo_mapa:
+    folium.TileLayer(
+        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        attr="Google",
+        name="Satélite",
+        max_zoom=21
+    ).add_to(m)
+else:
+    folium.TileLayer(
+        tiles="https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
+        attr="Google",
+        name="Estradas",
+        max_zoom=21
+    ).add_to(m)
 
-        # Busca recursiva por todos os arquivos .shp e .pos nas subpastas
-        base_path = Path(tmpdir)
-        shp_files = sorted(list(base_path.rglob("*.shp")))
-        pos_files = sorted(list(base_path.rglob("*.pos")))
+bounds = []
+centro_lat, centro_lon = None, None
+html_legenda = ""
 
-        if not shp_files:
-            st.warning("Nenhum arquivo .shp foi encontrado dentro do arquivo .zip.")
-            st.stop()
+for idx, item in enumerate(itens_selecionados):
+    lbl = item["label"]
+    caminho_shp = item["path"]
+    cor_atual = CORES_BLOCOS[idx % len(CORES_BLOCOS)]
+    
+    try:
+        gdf = gpd.read_file(caminho_shp)
+        if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
+            gdf = gdf.to_crs(epsg=4326)
+        elif gdf.crs is None:
+            gdf.set_crs(epsg=4326, inplace=True)
 
-        # Cria rótulos amigáveis mostrando a pasta/bloco (ex: 8037_004_R / BLOCO_1 / LineFeature.shp)
-        shp_options = {}
-        for shp in shp_files:
-            rel_parts = shp.relative_to(base_path).parts
-            label = " / ".join(rel_parts[-3:]) if len(rel_parts) >= 3 else str(shp.relative_to(base_path))
-            # Garante unicidade caso existam caminhos parecidos
-            if label in shp_options:
-                label = str(shp.relative_to(base_path))
-            shp_options[label] = shp
+        gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
 
-        # Controles no topo da página (muito mais prático no celular que barra lateral)
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            selecionados = st.multiselect(
-                "📂 Selecione as camadas / blocos para exibir no mapa:",
-                options=list(shp_options.keys()),
-                default=[list(shp_options.keys())[0]]
-            )
-        with col2:
-            cor_linha = st.color_picker("🎨 Cor do traçado", "#00FFAA")
+        if not gdf.empty:
+            minx, miny, maxx, maxy = gdf.total_bounds
+            bounds.append([miny, minx])
+            bounds.append([maxy, maxx])
 
-        if selecionados:
-            # Inicializa o mapa com Google Satélite Híbrido (Satélite + Nomes/Estradas)
-            m = folium.Map(
-                location=[-22.8526, -47.4446],
-                zoom_start=15,
-                tiles=None,
-                control_scale=True
-            )
+            centro_lat = (miny + maxy) / 2
+            centro_lon = (minx + maxx) / 2
 
-            # Camada 1: Google Satélite Híbrido (Padrão)
-            folium.TileLayer(
-                tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-                attr="Google Satellite Hybrid",
-                name="Satélite + Rótulos (Google)",
-                max_zoom=21,
-                overlay=False,
-                control=True
+            # Contorno preto para alto contraste sob luz solar
+            folium.GeoJson(
+                gdf,
+                style_function=lambda x: {
+                    "color": "#000000",
+                    "weight": 6,
+                    "opacity": 0.75
+                },
+                tooltip=lbl
             ).add_to(m)
 
-            # Camada 2: Google Satélite Puro
-            folium.TileLayer(
-                tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-                attr="Google Satellite",
-                name="Satélite Puro (Google)",
-                max_zoom=21,
-                overlay=False,
-                control=True
+            # Traçado colorido principal
+            folium.GeoJson(
+                gdf,
+                name=lbl,
+                style_function=lambda x, cor=cor_atual: {
+                    "color": cor,
+                    "weight": 3.5,
+                    "opacity": 1.0,
+                    "fillColor": cor,
+                    "fillOpacity": 0.3
+                },
+                tooltip=f"<b>{lbl}</b>"
             ).add_to(m)
 
-            # Camada 3: Mapa de Ruas (OpenStreetMap)
-            folium.TileLayer(
-                tiles="OpenStreetMap",
-                name="Mapa de Ruas (OSM)",
-                overlay=False,
-                control=True
+            # Pino identificador no centro do bloco
+            folium.Marker(
+                location=[centro_lat, centro_lon],
+                tooltip=lbl,
+                popup=f"<b>{lbl}</b>",
+                icon=folium.Icon(
+                    color="orange" if item["operacao"] == "TRANSBORDO" else "green",
+                    icon="info-sign"
+                )
             ).add_to(m)
 
-            bounds = []
-            tabelas_atributos = {}
+            html_legenda += f'<span class="legenda-item" style="background-color: {cor_atual};">{lbl}</span>'
 
-            for label in selecionados:
-                shp_path = shp_options[label]
-                try:
-                    gdf = gpd.read_file(shp_path)
+    except Exception:
+        st.warning(f"Não foi possível carregar {lbl}.")
 
-                    # Reprojeta para WGS84 (Lat/Lon) caso tenha .prj em UTM ou outro sistema
-                    if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
-                        gdf = gdf.to_crs(epsg=4326)
-                    elif gdf.crs is None:
-                        gdf.set_crs(epsg=4326, inplace=True)
+if bounds:
+    m.fit_bounds(bounds)
 
-                    # Remove geometrias nulas/vazias
-                    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notna()]
+Fullscreen(
+    position="topleft",
+    title="Tela Cheia",
+    title_cancel="Sair da Tela Cheia",
+    force_separate_button=True
+).add_to(m)
 
-                    if not gdf.empty:
-                        # Armazena limites para centralizar o zoom automaticamente
-                        minx, miny, maxx, maxy = gdf.total_bounds
-                        bounds.append([miny, minx])
-                        bounds.append([maxy, maxx])
+LocateControl(
+    auto_start=False,
+    position="topleft",
+    strings={"title": "📍 Mostrar minha posição no mapa (GPS)"},
+    flyTo=True
+).add_to(m)
 
-                        # Colunas da tabela .dbf para exibir ao tocar na linha/polígono
-                        colunas_attr = [c for c in gdf.columns if c != "geometry"]
-                        tabelas_atributos[label] = gdf[colunas_attr]
+st.markdown(f"**🎨 Legenda dos blocos marcados ({len(itens_selecionados)}):**<br>{html_legenda}", unsafe_allow_html=True)
 
-                        tooltip = folium.GeoJsonTooltip(fields=colunas_attr) if colunas_attr else None
-                        popup = folium.GeoJsonPopup(fields=colunas_attr) if colunas_attr else None
+if centro_lat and centro_lon:
+    link_google_maps = f"https://www.google.com/maps/dir/?api=1&destination={centro_lat},{centro_lon}"
+    st.markdown(
+        f'<a href="{link_google_maps}" target="_blank" class="btn-maps">'
+        f'🧭 IR ATÉ A ÁREA SELECIONADA (ABRIR GOOGLE MAPS)</a>',
+        unsafe_allow_html=True
+    )
 
-                        folium.GeoJson(
-                            gdf,
-                            name=label,
-                            style_function=lambda x, cor=cor_linha: {
-                                "color": cor,
-                                "weight": 3,
-                                "opacity": 0.9,
-                                "fillColor": cor,
-                                "fillOpacity": 0.25
-                            },
-                            tooltip=tooltip,
-                            popup=popup
-                        ).add_to(m)
-
-                except Exception as e:
-                    st.error(f"Erro ao carregar {label}: {e}")
-
-            # Adiciona marcadores dos arquivos .pos encontrados nas pastas selecionadas
-            for pos in pos_files:
-                coords = parse_pos_filename(pos.name)
-                if coords:
-                    folium.Marker(
-                        location=[coords[0], coords[1]],
-                        popup=f"<b>Arquivo POS:</b> {pos.name}<br>Lat: {coords[0]}<br>Lon: {coords[1]}",
-                        tooltip=f"Ponto Base ({pos.name})",
-                        icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")
-                    ).add_to(m)
-
-            # Ajusta o zoom automaticamente para enquadrar os blocos selecionados
-            if bounds:
-                m.fit_bounds(bounds)
-
-            # Botões úteis para celular: Tela Cheia e GPS em tempo real
-            Fullscreen(position="topleft", title="Tela Cheia", title_cancel="Sair").add_to(m)
-            LocateControl(auto_start=False, strings={"title": "Mostrar minha localização GPS"}).add_to(m)
-            folium.LayerControl(position="topright", collapsed=True).add_to(m)
-
-            # Renderiza o mapa responsivo
-            st_folium(m, use_container_width=True, height=520, returned_objects=[])
-
-            # Aba expansível para consultar a tabela .dbf no celular sem poluir a tela
-            with st.expander("📋 Ver Tabela de Atributos (.dbf) dos itens selecionados"):
-                for label, df_attr in tabelas_atributos.items():
-                    st.markdown(f"**{label}** ({len(df_attr)} registros)")
-                    st.dataframe(df_attr, use_container_width=True)
-        else:
-            st.info("Selecione pelo menos um arquivo na lista acima para visualizar no mapa.")
+st_folium(m, use_container_width=True, height=500, returned_objects=[])
